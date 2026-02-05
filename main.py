@@ -71,9 +71,9 @@ classes_file = 'coco.names'
 # 下载函数（添加用户代理头）
 def download_file(url, filename, fallback_urls=None, min_expected_size=0):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.请求.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req) as response:
+        with urllib.请求.urlopen(req) as response:
             # 检查Content-Length是否符合预期
             content_length = response.getheader('Content-Length')
             if content_length and min_expected_size > 0:
@@ -481,3 +481,5 @@ print("程序已退出")
 
 input("请输入任意字符结束")
 
+#114514
+#Windows_123_fish only
