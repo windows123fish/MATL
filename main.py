@@ -80,9 +80,9 @@ classes_file = 'coco.names'
 
 def download_file(url, filename, fallback_urls=None, min_expected_size=0):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.请求.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req) as response:
+        with urllib.请求.urlopen(req) as response:
             content_length = response.getheader('Content-Length')
             if content_length and min_expected_size > 0:
                 if int(content_length) < min_expected_size:
@@ -367,7 +367,7 @@ def get_camera_name_windows():
         devicelist = win32com.client.Dispatch("WIA.DeviceManager").DeviceInfos
         
         for device_info in devicelist:
-            if device_info.Type == 3:  # VideoDeviceType
+            if device_info.类型 == 3:  # VideoDeviceType
                 camera_names.append(device_info.Properties("Name").Value)
         
         pythoncom.CoUninitialize()
@@ -397,8 +397,8 @@ def get_camera_name_windows():
         
         camera_names = []
         for device in devices:
-            if device.Name:
-                camera_names.append(device.Name)
+            if device.名字:
+                camera_names.append(device.名字)
         
         if camera_names:
             return camera_names
@@ -613,5 +613,3 @@ try:
 finally:
     cap.release()
     cv2.destroyAllWindows()
-
-#Windows_123_fish only
