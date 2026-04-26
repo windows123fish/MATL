@@ -1,0 +1,804 @@
+import os
+import sys
+
+# ✅ 方案二：禁止 PyQt5 自动加载平台插件（必须第一行就设置）
+os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = ""
+os.environ["QT_PLUGIN_PATH"] = ""
+
+# ✅ 方案一：强制 torch 在 PyQt5 之前加载（关键！）
+print("正在加载PyTorch...")
+import torch
+print(f"PyTorch版本: {torch.__version__}")
+
+# ✅ 然后再加载 ultralytics
+from ultralytics import YOLO
+
+import cv2
+import urllib.request
+import shutil
+import numpy as np
+import traceback
+import ctypes
+import webbrowser
+import pyperclip
+
+# 设置Qt平台插件路径
+# 尝试直接导入PyQt5并获取其安装路径
+try:
+    import PyQt5
+    pyqt5_path = os.path.dirname(PyQt5.__file__)
+    # 尝试Qt和Qt5两种可能的文件夹名称
+    for qt_folder in ['Qt', 'Qt5']:
+        qt_plugins_path = os.path.join(pyqt5_path, qt_folder, 'plugins')
+        if os.path.exists(qt_plugins_path):
+            os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = qt_plugins_path
+            print(f"设置Qt平台插件路径: {qt_plugins_path}")
+            break
+    else:
+        print(f"Qt平台插件路径不存在")
+        # 尝试其他可能的路径
+        possible_paths = []
+        for qt_folder in ['Qt', 'Qt5']:
+            possible_paths.append(os.path.join(os.path.dirname(sys.executable), 'Lib', 'site-packages', 'PyQt5', qt_folder, 'plugins'))
+            possible_paths.append(os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming', 'Python', 'Python38', 'site-packages', 'PyQt5', qt_folder, 'plugins'))
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = path
+                print(f"设置Qt平台插件路径: {path}")
+                break
+        else:
+            print("警告: 未找到Qt平台插件路径")
+            print("请确保已正确安装PyQt5")
+except ImportError:
+    print("错误: 未找到PyQt5模块")
+    print("请运行: pip install PyQt5")
+    sys.exit(1)
+
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QListWidget, QListWidgetItem, QMessageBox, QDialog, QSizePolicy, QCheckBox, QScrollArea
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEvent
+from PyQt5.QtGui import QImage, QPixmap, QFont
+
+# 导入PIL库（尝试导入）
+try:
+    import pkg_resources.py2_warn
+except ImportError:
+    pass
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    pil_available = True
+except ImportError:
+    print("未找到PIL库，请安装: pillow")
+    pil_available = False
+    sys.exit(1)
+
+
+def put_chinese_text(img, text, position, font_size=20, color=(0, 0, 0)):
+    if not pil_available:
+        cv2.putText(img, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_size/20, color, 2)
+        return img
+    
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+
+    font_path = None
+    if os.name == 'nt':
+        possible_fonts = [
+            r'C:\Windows\Fonts\simhei.ttf',
+            r'C:\Windows\Fonts\simsun.ttc',
+            r'C:\Windows\Fonts\microsoftyahei.ttf',
+        ]
+        for font in possible_fonts:
+            if os.path.exists(font):
+                font_path = font
+                break
+    
+    try:
+        if font_path:
+            font = ImageFont.truetype(font_path, font_size)
+        else:
+            font = ImageFont.load_default()
+        draw.text(position, text, font=font, fill=(color[2], color[1], color[0]))
+        img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    except Exception as e:
+        print(f"PIL绘制失败，使用OpenCV: {e}")
+        cv2.putText(img, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_size/20, color, 2)
+    
+    return img
+
+
+def draw_rounded_rectangle(img, pt1, pt2, color, thickness=-1, radius=20):
+    x1, y1 = pt1
+    x2, y2 = pt2
+    
+    cv2.rectangle(img, (x1 + radius, y1), (x2 - radius, y2), color, thickness)
+    cv2.rectangle(img, (x1, y1 + radius), (x2, y2 - radius), color, thickness)
+    
+    cv2.circle(img, (x1 + radius, y1 + radius), radius, color, thickness)
+    cv2.circle(img, (x2 - radius, y1 + radius), radius, color, thickness)
+    cv2.circle(img, (x1 + radius, y2 - radius), radius, color, thickness)
+    cv2.circle(img, (x2 - radius, y2 - radius), radius, color, thickness)
+    
+    return img
+
+
+# ✅ 加载YOLO26n模型
+print("正在加载YOLO26n模型...")
+model = YOLO('yolo26n.pt')
+print("YOLO26n模型加载成功！")
+use_ultralytics = True
+# YOLO26n使用的类别列表
+classes = model.names
+# 禁用的类别列表（集合，快速查找）
+disabled_classes = set()
+
+
+# 使用码验证对话框
+class LicenseDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("使用码验证")
+        self.setFixedSize(500, 450)
+        self.setStyleSheet("background-color: white;")
+        
+        self.correct_code = "Windows123fish"
+        self.max_attempts = 5
+        self.attempts = 0
+        self.user_input = ""
+        self.show_error = False
+        
+        layout = QVBoxLayout()
+        
+        # 标题栏
+        header_widget = QWidget()
+        header_layout = QHBoxLayout(header_widget)
+        header_widget.setStyleSheet("background-color: #FFB6C1; border-radius: 15px;")
+        
+        title_label = QLabel("使用码验证")
+        title_label.setFont(QFont("Microsoft YaHei", 24, QFont.Bold))
+        title_label.setStyleSheet("color: white;")
+        header_layout.addWidget(title_label, Qt.AlignLeft)
+        
+        close_button = QPushButton("×")
+        close_button.setFixedSize(40, 40)
+        close_button.setStyleSheet("background-color: #FFC0CB; border-radius: 20px; color: white; font-size: 24px;")
+        close_button.clicked.connect(self.reject)
+        header_layout.addWidget(close_button, Qt.AlignRight)
+        
+        layout.addWidget(header_widget)
+        
+        # 提示信息
+        info_widget = QWidget()
+        info_widget.setStyleSheet("background-color: #E0FFFF; border: 2px solid #B0E0E6; border-radius: 10px; margin: 20px;")
+        info_layout = QVBoxLayout(info_widget)
+        
+        info_label1 = QLabel("重要提示：本软件为免费软件，如果您是购买的，请尽快联系退款与举报！")
+        info_label1.setFont(QFont("Microsoft YaHei", 14))
+        info_label1.setStyleSheet("color: #0066CC;")
+        info_layout.addWidget(info_label1)
+        
+        layout.addWidget(info_widget)
+        
+        # 输入区域
+        input_label = QLabel("请输入使用码以继续使用本软件")
+        input_label.setFont(QFont("Microsoft YaHei", 14))
+        input_label.setStyleSheet("color: #404040; margin: 0 30px 15px 30px;")
+        input_label.setWordWrap(True)
+        input_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(input_label)
+        
+        input_layout = QHBoxLayout()
+        input_layout.setContentsMargins(40, 10, 40, 20)
+        
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("请输入使用码")
+        self.code_input.setEchoMode(QLineEdit.Password)
+        self.code_input.setFont(QFont("Microsoft YaHei", 16))
+        self.code_input.setStyleSheet("background-color: #FFE4E1; border: 2px solid #FFB6C1; border-radius: 10px; padding: 12px;")
+        self.code_input.returnPressed.connect(self.verify_code)
+        input_layout.addWidget(self.code_input, 4)
+        
+        verify_button = QPushButton("验证")
+        verify_button.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
+        verify_button.setStyleSheet("background-color: #FF69B4; color: white; border-radius: 10px; padding: 12px 20px;")
+        verify_button.clicked.connect(self.verify_code)
+        input_layout.addWidget(verify_button, 1)
+        
+        layout.addLayout(input_layout)
+        
+        # 错误信息
+        self.error_label = QLabel()
+        self.error_label.setFont(QFont("Microsoft YaHei", 12))
+        self.error_label.setStyleSheet("color: red; text-align: center; margin: 0 30px 20px 30px;")
+        self.error_label.setWordWrap(True)
+        self.error_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.error_label)
+        
+        # 底部提示
+        bottom_widget = QWidget()
+        bottom_widget.setStyleSheet("background-color: #F0F8FF; border-radius: 10px; margin: 0 30px 20px 30px;")
+        bottom_layout = QVBoxLayout(bottom_widget)
+        bottom_layout.setContentsMargins(20, 15, 20, 15)
+        
+        hint_label1 = QLabel("请使用enter(回车)键确认")
+        hint_label1.setFont(QFont("Microsoft YaHei", 12))
+        hint_label1.setStyleSheet("color: #9370DB;")
+        hint_label1.setAlignment(Qt.AlignCenter)
+        bottom_layout.addWidget(hint_label1)
+        
+        hint_label2 = QLabel("使用码：Windows123fish")
+        hint_label2.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
+        hint_label2.setStyleSheet("color: #9370DB; margin-top: 5px;")
+        hint_label2.setAlignment(Qt.AlignCenter)
+        bottom_layout.addWidget(hint_label2)
+        
+        layout.addWidget(bottom_widget)
+        
+        self.setLayout(layout)
+        self.code_input.setFocus()
+    
+    def verify_code(self):
+        self.user_input = self.code_input.text()
+        if self.user_input == self.correct_code:
+            QMessageBox.information(self, "验证成功", "欢迎使用本软件")
+            self.accept()
+        else:
+            self.attempts += 1
+            self.show_error = True
+            self.error_label.setText(f"使用码错误，请重试\n剩余尝试次数：{self.max_attempts - self.attempts}")
+            self.code_input.clear()
+            if self.attempts >= self.max_attempts:
+                QMessageBox.critical(self, "验证失败", "尝试次数已用完")
+                self.reject()
+
+
+# 摄像头选择对话框
+class CameraSelectDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("摄像头选择")
+        self.setFixedSize(500, 400)
+        self.setStyleSheet("background-color: white;")
+        
+        self.available_cameras = []
+        self.camera_info = []
+        self.selected_camera = None
+        
+        layout = QVBoxLayout()
+        
+        # 标题栏
+        header_widget = QWidget()
+        header_layout = QHBoxLayout(header_widget)
+        header_widget.setStyleSheet("background-color: #FFB6C1; border-radius: 15px;")
+        
+        title_label = QLabel("摄像头选择")
+        title_label.setFont(QFont("Microsoft YaHei", 24, QFont.Bold))
+        title_label.setStyleSheet("color: white;")
+        header_layout.addWidget(title_label, Qt.AlignLeft)
+        
+        close_button = QPushButton("×")
+        close_button.setFixedSize(40, 40)
+        close_button.setStyleSheet("background-color: #FFC0CB; border-radius: 20px; color: white; font-size: 24px;")
+        close_button.clicked.connect(self.reject)
+        header_layout.addWidget(close_button, Qt.AlignRight)
+        
+        layout.addWidget(header_widget)
+        
+        # 摄像头列表
+        self.camera_list = QListWidget()
+        self.camera_list.setFont(QFont("Microsoft YaHei", 16))
+        self.camera_list.setStyleSheet("background-color: white; border: 2px solid #B0E0E6; border-radius: 10px; margin: 20px;")
+        self.camera_list.itemClicked.connect(self.on_camera_selected)
+        layout.addWidget(self.camera_list)
+        
+        # 确认按钮
+        confirm_button = QPushButton("确认选择")
+        confirm_button.setFont(QFont("Microsoft YaHei", 14))
+        confirm_button.setStyleSheet("background-color: #FF69B4; color: white; border-radius: 10px; padding: 10px; margin: 0 20px 20px 20px;")
+        confirm_button.clicked.connect(self.accept)
+        layout.addWidget(confirm_button)
+        
+        self.setLayout(layout)
+        self.detect_cameras()
+    
+    def detect_cameras(self):
+        max_cameras = 10
+        self.available_cameras = []
+        self.camera_info = []
+        
+        print("正在检测可用摄像头...")
+        for i in range(max_cameras):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                self.available_cameras.append(i)
+                
+                try:
+                    name = cap.get(cv2.CAP_PROP_DEVICE_NAME)
+                    if name is None or name == 0 or name == "":
+                        name = None
+                    else:
+                        name = str(name)
+                        try:
+                            name = name.encode('latin1').decode('gbk')
+                        except:
+                            try:
+                                name = name.encode('latin1').decode('utf-8')
+                            except:
+                                pass
+                except:
+                    name = None
+                
+                try:
+                    backend = cap.get(cv2.CAP_PROP_BACKEND)
+                    backend_name = {
+                        cv2.CAP_ANY: "Any",
+                        cv2.CAP_VFW: "VFW",
+                        cv2.CAP_V4L: "V4L",
+                        cv2.CAP_V4L2: "V4L2",
+                        cv2.CAP_FIREWIRE: "FireWire",
+                        cv2.CAP_IEEE1394: "IEEE1394",
+                        cv2.CAP_QT: "QT",
+                        cv2.CAP_GSTREAMER: "GStreamer",
+                        cv2.CAP_FFMPEG: "FFMPEG",
+                        cv2.CAP_DSHOW: "DirectShow",
+                        cv2.CAP_MSMF: "Media Foundation",
+                        cv2.CAP_WINRT: "Windows Runtime"
+                    }.get(backend, f"Backend {backend}")
+                    
+                    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    
+                    res_info = f" ({int(width)}x{int(height)}"
+                    if fps > 0:
+                        res_info += f" @ {int(fps)}fps"
+                    res_info += ""
+                    
+                    if name:
+                        display_name = f"{name}"
+                    else:
+                        display_name = f"{backend_name}"
+                except:
+                    display_name = f"摄像头 {i}"
+                    res_info = ""
+                
+                camera_info_str = f"{i}: {display_name}{res_info}"
+                self.camera_info.append(camera_info_str)
+                item = QListWidgetItem(camera_info_str)
+                self.camera_list.addItem(item)
+                cap.release()
+                print(f"发现摄像头 {i}: {display_name}{res_info}")
+        
+        if not self.available_cameras:
+            QMessageBox.critical(self, "错误", "未找到可用摄像头")
+            self.reject()
+        else:
+            # 默认选择第一个摄像头
+            self.camera_list.setCurrentRow(0)
+            self.selected_camera = self.available_cameras[0]
+    
+    def on_camera_selected(self, item):
+        index = self.camera_list.row(item)
+        if index < len(self.available_cameras):
+            self.selected_camera = self.available_cameras[index]
+    
+    def accept(self):
+        if self.selected_camera is not None:
+            super().accept()
+        else:
+            QMessageBox.warning(self, "警告", "请选择一个摄像头")
+
+
+# 禁用类别对话框
+class DisableClassDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("禁用识别类别")
+        self.setFixedSize(550, 600)
+        self.setStyleSheet("background-color: white;")
+        
+        layout = QVBoxLayout()
+        
+        # 标题栏
+        header_widget = QWidget()
+        header_layout = QHBoxLayout(header_widget)
+        header_widget.setStyleSheet("background-color: #FFB6C1; border-radius: 15px;")
+        
+        title_label = QLabel("禁用识别类别")
+        title_label.setFont(QFont("Microsoft YaHei", 20, QFont.Bold))
+        title_label.setStyleSheet("color: white;")
+        header_layout.addWidget(title_label, Qt.AlignLeft)
+        
+        close_button = QPushButton("×")
+        close_button.setFixedSize(40, 40)
+        close_button.setStyleSheet("background-color: #FFC0CB; border-radius: 20px; color: white; font-size: 24px;")
+        close_button.clicked.connect(self.reject)
+        header_layout.addWidget(close_button, Qt.AlignRight)
+        
+        layout.addWidget(header_widget)
+        
+        # 说明文字
+        info_label = QLabel("勾选的类别将不会被识别显示")
+        info_label.setFont(QFont("Microsoft YaHei", 12))
+        info_label.setStyleSheet("color: #9370DB; padding: 15px;")
+        info_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(info_label)
+        
+        # 滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("""
+            QScrollArea { 
+                border: 2px solid #FFB6C1; 
+                border-radius: 10px;
+                background-color: #FFF0F5;
+            }
+        """)
+        
+        scroll_content = QWidget()
+        self.scroll_layout = QVBoxLayout(scroll_content)
+        
+        # 保存复选框的引用
+        self.checkboxes = []
+        
+        # 动态生成所有类别的复选框
+        for class_id, class_name in classes.items():
+            checkbox = QCheckBox(f"{class_id}. {class_name}")
+            checkbox.setFont(QFont("Microsoft YaHei", 11))
+            checkbox.setStyleSheet("padding: 8px; color: #696969;")
+            # 如果这个类别已经被禁用，则勾选
+            if class_name in disabled_classes:
+                checkbox.setChecked(True)
+            self.checkboxes.append((class_name, checkbox))
+            self.scroll_layout.addWidget(checkbox)
+        
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll)
+        
+        # 按钮区域
+        button_layout = QHBoxLayout()
+        
+        clear_button = QPushButton("清除全部")
+        clear_button.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
+        clear_button.setStyleSheet("background-color: #87CEEB; color: white; border-radius: 10px; padding: 12px;")
+        clear_button.clicked.connect(self.clear_all)
+        button_layout.addWidget(clear_button)
+        
+        save_button = QPushButton("保存")
+        save_button.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
+        save_button.setStyleSheet("background-color: #FF69B4; color: white; border-radius: 10px; padding: 12px 30px;")
+        save_button.clicked.connect(self.save_and_close)
+        button_layout.addWidget(save_button)
+        
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+    
+    def clear_all(self):
+        """清除所有勾选"""
+        for class_name, checkbox in self.checkboxes:
+            checkbox.setChecked(False)
+    
+    def save_and_close(self):
+        """保存选择并关闭"""
+        global disabled_classes
+        # 清空之前的禁用列表
+        disabled_classes.clear()
+        # 添加新勾选的类别
+        for class_name, checkbox in self.checkboxes:
+            if checkbox.isChecked():
+                disabled_classes.add(class_name)
+        
+        QMessageBox.information(self, "成功", f"已禁用 {len(disabled_classes)} 个类别")
+        self.accept()
+
+
+# 视频处理线程
+class VideoThread(QThread):
+    change_pixmap_signal = pyqtSignal(QImage)
+    
+    def __init__(self, camera_id):
+        super().__init__()
+        self.camera_id = camera_id
+        self.running = True
+    
+    def run(self):
+        cap = cv2.VideoCapture(self.camera_id)
+        while self.running:
+            ret, frame = cap.read()
+            if ret:
+                # 目标检测
+                if use_ultralytics:
+                    # 使用ultralytics库的YOLO26n模型
+                    # conf=0.5：只显示置信度>50%的检测结果
+                    # iou=0.45：重叠超过45%的框会被NMS过滤掉，避免重叠
+                    results = model(frame, conf=0.5, iou=0.45)
+                    
+                    # 处理检测结果
+                    for result in results:
+                        for box in result.boxes:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            confidence = float(box.conf[0])
+                            class_id = int(box.cls[0])
+                            class_name = classes[class_id]
+                            
+                            # 如果类别被禁用，则跳过
+                            if class_name in disabled_classes:
+                                continue
+                            
+                            # 绘制检测结果
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            label = f"{class_name}: {confidence:.2f}"
+                            frame = put_chinese_text(frame, label, (x1, y1 - 10), font_size=14, color=(0, 255, 0))
+                else:
+                    # 使用YOLOv3-tiny模型
+                    blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (416, 416), swapRB=True, crop=False)
+                    net.setInput(blob)
+                    
+                    # 获取输出层
+                    layer_names = net.getLayerNames()
+                    try:
+                        output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+                    except TypeError:
+                        output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+                    
+                    outputs = net.forward(output_layers)
+                    
+                    # 处理检测结果
+                    boxes = []
+                    confidences = []
+                    class_ids = []
+                    
+                    for output in outputs:
+                        for detection in output:
+                            scores = detection[5:]
+                            class_id = np.argmax(scores)
+                            confidence = scores[class_id]
+                            
+                            if confidence > 0.5:
+                                center_x = int(detection[0] * frame.shape[1])
+                                center_y = int(detection[1] * frame.shape[0])
+                                width = int(detection[2] * frame.shape[1])
+                                height = int(detection[3] * frame.shape[0])
+                                
+                                x = int(center_x - width / 2)
+                                y = int(center_y - height / 2)
+                                
+                                boxes.append([x, y, width, height])
+                                confidences.append(float(confidence))
+                                class_ids.append(class_id)
+                    
+                    # 非极大值抑制
+                    indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+                    
+                    # 绘制检测结果
+                    if len(indices) > 0:
+                        for i in indices.flatten():
+                            x, y, w, h = boxes[i]
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                            
+                            label = f"{classes[class_ids[i]]}: {confidences[i]:.2f}"
+                            frame = put_chinese_text(frame, label, (x, y - 10), font_size=14, color=(0, 255, 0))
+                
+                # 转换为QImage
+                rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb_image.shape
+                bytes_per_line = ch * w
+                convert_to_Qt_format = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                # 发送原始图像，由主窗口根据当前大小进行缩放
+                self.change_pixmap_signal.emit(convert_to_Qt_format)
+        
+        cap.release()
+    
+    def stop(self):
+        self.running = False
+        self.wait()
+
+
+# 自定义主窗口
+class MainWindow(QMainWindow):
+    def __init__(self, camera_id):
+        super().__init__()
+        # 隐藏默认标题栏
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setGeometry(100, 100, 900, 700)
+        
+        # 主窗口部件
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        
+        # 主布局
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 自定义标题栏
+        title_bar = QWidget()
+        title_bar.setFixedHeight(60)
+        title_bar.setStyleSheet("background-color: #FFB6C1; border-top-left-radius: 15px; border-top-right-radius: 15px;")
+        title_layout = QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(20, 0, 20, 0)
+        
+        # 标题
+        title_label = QLabel("实时目标检测")
+        title_label.setFont(QFont("Microsoft YaHei", 18, QFont.Bold))
+        title_label.setStyleSheet("color: white;")
+        title_layout.addWidget(title_label, 1, Qt.AlignLeft | Qt.AlignVCenter)
+        
+        # 最小化按钮
+        min_button = QPushButton("_")
+        min_button.setFixedSize(30, 30)
+        min_button.setStyleSheet("background-color: #FFC0CB; color: white; border-radius: 15px; font-size: 16px;")
+        min_button.clicked.connect(self.showMinimized)
+        title_layout.addWidget(min_button, Qt.AlignRight | Qt.AlignVCenter)
+        
+        # 最大化/还原按钮
+        self.max_button = QPushButton("□")
+        self.max_button.setFixedSize(30, 30)
+        self.max_button.setStyleSheet("background-color: #FFC0CB; color: white; border-radius: 15px; font-size: 16px;")
+        self.max_button.clicked.connect(self.toggle_maximize)
+        title_layout.addWidget(self.max_button, Qt.AlignRight | Qt.AlignVCenter)
+        
+        # 关闭按钮
+        close_button = QPushButton("×")
+        close_button.setFixedSize(30, 30)
+        close_button.setStyleSheet("background-color: #FF69B4; color: white; border-radius: 15px; font-size: 16px;")
+        close_button.clicked.connect(self.close)
+        title_layout.addWidget(close_button, Qt.AlignRight | Qt.AlignVCenter)
+        
+        main_layout.addWidget(title_bar)
+        
+        # 内容区域
+        content_widget = QWidget()
+        content_widget.setStyleSheet("background-color: white; border-bottom-left-radius: 15px; border-bottom-right-radius: 15px; padding: 20px;")
+        content_layout = QVBoxLayout(content_widget)
+        
+        # 视频显示标签
+        self.video_label = QLabel()
+        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setStyleSheet("border: 2px solid #B0E0E6; border-radius: 10px; min-height: 480px;")
+        self.video_label.setScaledContents(True)
+        content_layout.addWidget(self.video_label)
+        
+        # 控制按钮
+        control_layout = QHBoxLayout()
+        control_layout.setContentsMargins(0, 20, 0, 0)
+        control_layout.setSpacing(15)
+        
+        self.start_button = QPushButton("开始检测")
+        self.start_button.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
+        self.start_button.setStyleSheet("background-color: #FF69B4; color: white; border-radius: 10px; padding: 12px 24px;")
+        self.start_button.clicked.connect(self.start_detection)
+        control_layout.addWidget(self.start_button)
+        
+        self.stop_button = QPushButton("停止检测")
+        self.stop_button.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
+        self.stop_button.setStyleSheet("background-color: #FF69B4; color: white; border-radius: 10px; padding: 12px 24px;")
+        self.stop_button.clicked.connect(self.stop_detection)
+        self.stop_button.setEnabled(False)
+        control_layout.addWidget(self.stop_button)
+        
+        self.switch_button = QPushButton("切换摄像头")
+        self.switch_button.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
+        self.switch_button.setStyleSheet("background-color: #4682B4; color: white; border-radius: 10px; padding: 12px 24px;")
+        self.switch_button.clicked.connect(self.switch_camera)
+        control_layout.addWidget(self.switch_button)
+        
+        self.disable_button = QPushButton("禁用类别")
+        self.disable_button.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
+        self.disable_button.setStyleSheet("background-color: #9370DB; color: white; border-radius: 10px; padding: 12px 24px;")
+        self.disable_button.clicked.connect(self.open_disable_dialog)
+        control_layout.addWidget(self.disable_button)
+        
+        content_layout.addLayout(control_layout)
+        main_layout.addWidget(content_widget)
+        
+        # 视频线程
+        self.thread = None
+        self.camera_id = camera_id
+        
+        # 窗口拖动相关
+        self.dragging = False
+        self.drag_start_pos = None
+        
+        # 安装事件过滤器
+        title_bar.installEventFilter(self)
+    
+    def eventFilter(self, obj, event):
+        """事件过滤器，用于实现窗口拖动"""
+        if event.type() == QEvent.MouseButtonPress:
+            if event.button() == Qt.LeftButton:
+                self.dragging = True
+                self.drag_start_pos = event.globalPos() - self.frameGeometry().topLeft()
+                return True
+        elif event.type() == QEvent.MouseMove:
+            if self.dragging:
+                self.move(event.globalPos() - self.drag_start_pos)
+                return True
+        elif event.type() == QEvent.MouseButtonRelease:
+            if event.button() == Qt.LeftButton:
+                self.dragging = False
+                return True
+        return super().eventFilter(obj, event)
+    
+    def toggle_maximize(self):
+        """切换窗口最大化/还原状态"""
+        if self.isMaximized():
+            self.showNormal()
+            self.max_button.setText("□")
+        else:
+            self.showMaximized()
+            self.max_button.setText("▢")
+    
+    def start_detection(self):
+        self.thread = VideoThread(self.camera_id)
+        self.thread.change_pixmap_signal.connect(self.update_image)
+        self.thread.start()
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+    
+    def stop_detection(self):
+        if self.thread:
+            self.thread.stop()
+            self.thread = None
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+    
+    def update_image(self, qt_image):
+        self.video_label.setPixmap(QPixmap.fromImage(qt_image))
+    
+    def switch_camera(self):
+        # 停止当前检测
+        self.stop_detection()
+        
+        # 打开摄像头选择对话框
+        camera_dialog = CameraSelectDialog(self)
+        if camera_dialog.exec_():
+            # 用户选择了新的摄像头
+            new_camera_id = camera_dialog.selected_camera
+            if new_camera_id != self.camera_id:
+                self.camera_id = new_camera_id
+                QMessageBox.information(self, "切换成功", f"已切换到摄像头 {self.camera_id}")
+            else:
+                QMessageBox.information(self, "提示", "当前已选择该摄像头")
+    
+    def open_disable_dialog(self):
+        """打开禁用类别对话框"""
+        disable_dialog = DisableClassDialog(self)
+        disable_dialog.exec_()
+    
+    def closeEvent(self, event):
+        self.stop_detection()
+        event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    
+    # 显示使用码验证
+    license_dialog = LicenseDialog()
+    if not license_dialog.exec_():
+        print("验证失败，程序退出")
+        return
+    
+    print("验证成功，欢迎使用！")
+    
+    # 显示摄像头选择
+    camera_dialog = CameraSelectDialog()
+    if not camera_dialog.exec_():
+        print("未选择摄像头，程序退出")
+        return
+    
+    camera_id = camera_dialog.selected_camera
+    
+    # 显示主窗口
+    window = MainWindow(camera_id)
+    window.show()
+    
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
